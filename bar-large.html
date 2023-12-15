@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en" style="height: 100%">
+<head>
+    <meta charset="utf-8">
+</head>
+<body style="height: 100%; margin: 0">
+<div id="container" style="height: 100%"></div>
+<script type="text/javascript" src="https://fastly.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<script type="text/javascript">
+
+    const one_second = 1_000;
+    const one_minute = one_second * 60;
+    const one_hour = one_minute * 60;
+
+    let chart_visibility=window.location.search;
+    chart_visibility=chart_visibility.split('visibility=');
+    if (chart_visibility.length === 2) {
+        chart_visibility = +chart_visibility[1];
+    } else {
+        chart_visibility = 4;
+    }
+
+    var dom = document.getElementById('container');
+    var myChart = echarts.init(dom, null, {
+        renderer: 'canvas',
+        useDirtyRect: false
+    });
+
+    function getBatteryLines(batteryData) {
+        return batteryData.split('\n')
+            .filter(e => e !== '')
+            .filter(e => !e.endsWith("unknown"))
+            .filter(e => !e.endsWith("fully-charged"))
+            .map(e => e.split('\t'))
+            .map(e => ({
+                time: normalizeFromUnixTimestamp(+e[0]),
+                level: +e[1],
+                state: e[2],
+                source: 'real'
+            }));
+    }
+
+    const option = {
+        title: {
+            text: 'Showing data for the past ' + chart_visibility + ' hours',
+            left: 10
+        },
+        toolbox: {
+            feature: {
+                dataZoom: {
+                    yAxisIndex: false
+                },
+                saveAsImage: {
+                    pixelRatio: 2
+                }
+            }
+        },
+        tooltip: {
+            trigger: 'axis',
+            formatter: function (params) {
+                let options = myChart.getOption();
+                let index = params[0].dataIndex;
+                let batteryLine = options.batteryExtras[index];
+                if (!batteryLine) {
+                    return null;
+                }
+                let batteryLevel = batteryLine.level;
+                let time = options.xAxis[0].data[index];
+                let percentageChange = Math.abs(nummm(batteryLevel - batteryLine.originalLevelStatusChange));
+                return `${time} ${batteryLine.state}<br>
+                        ${batteryLine.originalLevelStatusChange}% -> ${nummm(batteryLevel)}%<br>
+                        ${percentageChange}% in ${formatDuration(batteryLine.minutesSinceStatusChange)}
+                `
+            },
+            axisPointer: {
+                type: 'shadow'
+            }
+        },
+        grid: {
+            bottom: 90
+        },
+        dataZoom: [
+            {
+                type: 'inside'
+            },
+            {
+                type: 'slider'
+            }
+        ],
+        xAxis: {
+            data: [],
+            silent: false,
+            splitLine: {
+                show: false
+            },
+            splitArea: {
+                show: false
+            }
+        },
+        yAxis: {
+            splitArea: {
+                show: false
+            }
+        },
+        series: [
+            {
+                type: 'line',
+                data: []
+            },
+            {
+                type: 'line',
+                color: 'red',
+                data: []
+            }
+        ],
+        batteryExtras: {}
+    };
+
+    function normalizeFromUnixTimestamp(unixTimestamp) {
+        return normalize(unixTimestamp * one_second);
+    }
+
+    function normalize(timestamp) {
+        const date = new Date(timestamp);
+        date.setMilliseconds(0)
+        date.setSeconds(0)
+        return date.getTime();
+    }
+
+    function generateTimestamps() {
+        let date = new Date();
+        date.setMilliseconds(0);
+        date.setSeconds(0);
+
+        let startTime = date.getTime();
+        const endTime = startTime - one_hour * chart_visibility; // 5 hours
+
+        let timestamps = [];
+        while (startTime > endTime) {
+            timestamps.unshift(startTime);
+            startTime -= one_minute;
+        }
+        return timestamps;
+    }
+
+    function repopulate(chart, categoryData, levelDataCharging, levelDataDischarging, batteryData) {
+        let options = chart.getOption();
+        options.xAxis[0].data = categoryData;
+        options.series[0].data = levelDataCharging;
+        options.series[1].data = levelDataDischarging;
+        options.batteryExtras = batteryData;
+        options.title.text = 'cs'
+        chart.setOption(options);
+    }
+
+    function belongsInSameGroup(mappedElement, last) {
+        if (mappedElement.state !== last.state) {
+            return false;
+        }
+        return (mappedElement.time - last.time) <= (one_minute * 10);
+    }
+
+    function minutesInBetween(currentElement, priorElement) {
+        return (currentElement.time - priorElement.time) / one_minute;
+    }
+
+    function numm(number) {
+        return +number.toFixed(2);
+    }
+
+    function nummm(number) {
+        return +`${numm(number)}`.split('.')[0];
+    }
+
+    function deriveEvents(currentElement, priorElement) {
+        const chargeDiff = currentElement.level - priorElement.level;
+        let minutesInBetweenElements = minutesInBetween(currentElement, priorElement);
+        const increment = numm(chargeDiff / minutesInBetweenElements);
+        const result = [];
+        while (minutesInBetween(currentElement, priorElement) > 1) {
+            priorElement = ({
+                time: priorElement.time + one_minute,
+                level: numm(priorElement.level + increment),
+                state: priorElement.state,
+                source: 'derived'
+            });
+            result.push(priorElement);
+        }
+        return result;
+    }
+
+    function deriveMissingEvents(timestamps, mapped) {
+        let priorElement = {};
+        for (let i = 0; i < timestamps.length; i++) {
+            let timestamp = timestamps[i];
+            let currentElement = mapped[timestamp];
+            if (currentElement) {
+                if (belongsInSameGroup(currentElement, priorElement)) {
+                    if (minutesInBetween(currentElement, priorElement) > 1) {
+                        deriveEvents(currentElement, priorElement)
+                            .forEach(derived => {
+                                mapped[derived.time] = derived;
+                            })
+                    }
+                }
+                priorElement = currentElement;
+            }
+        }
+    }
+
+    function removeUnnecessaryEvents(batteryLines, timestamps) {
+        batteryLines = batteryLines.filter(e => timestamps.includes(e.time));
+
+        while (batteryLines.length === 0 && timestamps.length > 30) {
+            timestamps.pop();
+        }
+
+        while (timestamps.length > 10
+                && batteryLines.length > 0
+                && timestamps[timestamps.length - 1] !== batteryLines[batteryLines.length - 1].time) {
+
+            timestamps.pop();
+        }
+
+        while (timestamps.length > 10
+                && batteryLines.length > 0
+                && timestamps[0] !== batteryLines[0].time) {
+
+            timestamps.splice(0, 1);
+        }
+
+        return batteryLines;
+    }
+
+    function formatDuration(count) {
+        if (count === 0) {
+            return 'just started'
+        }
+        if (count < 60) {
+            return count + "m";
+        }
+        const hours = nummm(count / 60);
+        count -= hours * 60;
+        return hours + 'h' + nummm(count) + "m";
+    }
+
+    function addLabels(timestamps, mapped) {
+        let state = null;
+        let count = 0;
+        let originalLevel = 0;
+        for (const timestamp of timestamps) {
+            const batteryLine = mapped[timestamp];
+            if (batteryLine == null) {
+                state = null;
+                count = 0;
+                originalLevel = 0;
+                continue;
+            }
+            if (state === batteryLine.state) {
+                count++;
+            } else {
+                count = 0;
+                state = batteryLine.state;
+                originalLevel = batteryLine.level;
+            }
+            batteryLine.minutesSinceStatusChange = count;
+            batteryLine.originalLevelStatusChange = originalLevel;
+            if (count === 0) {
+                batteryLine.label = `${state} from ${originalLevel}%`;
+            } else {
+                batteryLine.label = `${state} from ${originalLevel}% for ${formatDuration(count)}`;
+            }
+        }
+    }
+
+    function formatTime(timestamp) {
+        let date = new Date(timestamp);
+        let hours = date.getHours() % 12;
+        let pm = date.getHours() / 12;
+        return hours + echarts.format.formatTime(':mm', timestamp, false) + (pm > 0 ?' pm' : ' am');
+    }
+
+    function fillInData(chart, batteryLines) {
+        let timestamps = generateTimestamps();
+        let batteryData = [];
+
+        batteryLines = removeUnnecessaryEvents(batteryLines, timestamps);
+
+        const mapped = {};
+        batteryLines.forEach(batteryLine => {
+            mapped[batteryLine.time] = batteryLine;
+        });
+
+        deriveMissingEvents(timestamps, mapped);
+
+        addLabels(timestamps, mapped);
+
+        const levelDataDischarging = [];
+        const timeLabels = [];
+        const levelData = [];
+        for (const timestamp of timestamps) {
+            const batteryLine = mapped[timestamp];
+            timeLabels.push(formatTime(timestamp))
+            batteryData.push(batteryLine);
+            // levelData.push(batteryLine?.level);
+            levelDataDischarging.push(batteryLine?.state === 'discharging' ? batteryLine?.level : null);
+            levelData.push(batteryLine?.state === 'charging' ? batteryLine?.level : null);
+        }
+        repopulate(chart, timeLabels, levelData, levelDataDischarging, batteryData);
+    }
+
+    if (option && typeof option === 'object') {
+        myChart.setOption(option);
+    }
+
+    window.addEventListener('resize', myChart.resize);
+
+    fetch('http://localhost:10000/history-charge.txt')
+        .catch(error => alert('error!'))
+        .then(response => response.text())
+        .then(text => fillInData(myChart, getBatteryLines(text)))
+
+</script>
+</body>
+</html>
